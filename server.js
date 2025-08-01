@@ -13,7 +13,7 @@ app.use(express.json());
 let pool;
 async function initDb() {
   pool = await mysql.createPool({
-    host: 'localhost',
+    host: 'mydb.render.com',
     user: 'mha7_api',
     password: 'mha7_api',
     database: 'mha7_api',
