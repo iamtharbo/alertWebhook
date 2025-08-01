@@ -9,7 +9,7 @@ const server = http.createServer(app);
 
 app.use(cors());
 app.use(express.json());
- 
+
 let pool;
 async function initDb() {
   pool = await mysql.createPool({
@@ -27,7 +27,7 @@ initDb().catch(err => {
   console.error('Failed to initialize DB connection:', err);
   process.exit(1);
 });
- 
+
 const io = new Server(server, {
   cors: {
     origin: "*",
@@ -37,7 +37,7 @@ const io = new Server(server, {
 io.on('connection', (socket) => {
   console.log('Client connected:', socket.id);
 });
- 
+
 app.post('/webhook', async (req, res) => {
   const payload = req.body;
 
@@ -45,12 +45,12 @@ app.post('/webhook', async (req, res) => {
     return res.status(400).json({ success: false, message: 'Empty payload' });
   }
 
-  try { 
+  try {
     await pool.query(
       'INSERT INTO form_submissions (payload, checked) VALUES (?, ?)',
       [JSON.stringify(payload), false]
     );
- 
+
     io.emit('form-submitted', payload);
 
     res.json({ success: true, message: 'Payload stored and event emitted' });
@@ -59,7 +59,7 @@ app.post('/webhook', async (req, res) => {
     res.status(500).json({ success: false, message: 'Database error' });
   }
 });
- 
+
 app.get('/pending-submissions', async (req, res) => {
   try {
     const [rows] = await pool.query(
@@ -71,7 +71,7 @@ app.get('/pending-submissions', async (req, res) => {
     res.status(500).json({ success: false, message: 'Database error' });
   }
 });
- 
+
 app.post('/mark-checked', async (req, res) => {
   const { id } = req.body;
   if (!id) {
