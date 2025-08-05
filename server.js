@@ -1,17 +1,36 @@
+const http = require('http');
 const WebSocket = require('ws');
 
-// Simple in-memory storage (for testing only - will reset on server restart)
+const server = http.createServer((req, res) => {
+  res.writeHead(200);
+  res.end('WebSocket server running');
+});
+
+const wss = new WebSocket.Server({ noServer: true });
+
+const allowedOrigins = ['https://mha777.com']; // add your allowed origins here
+
+server.on('upgrade', (request, socket, head) => {
+  const origin = request.headers.origin;
+  if (!allowedOrigins.includes(origin)) {
+    socket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
+    socket.destroy();
+    return;
+  }
+
+  wss.handleUpgrade(request, socket, head, (ws) => {
+    wss.emit('connection', ws, request);
+  });
+});
+
+const activeConnections = new Map();
 const submissions = new Map();
 const decisions = new Map();
-
-const wss = new WebSocket.Server({ port: process.env.PORT || 8080 });
-const activeConnections = new Map();
 
 wss.on('connection', (ws, req) => {
   const clientId = req.headers['sec-websocket-key'];
   activeConnections.set(clientId, ws);
 
-  // Check for pending decision
   if (decisions.has(clientId)) {
     ws.send(JSON.stringify({
       type: 'decision',
@@ -24,7 +43,7 @@ wss.on('connection', (ws, req) => {
   ws.on('message', (message) => {
     try {
       const data = JSON.parse(message);
-      
+
       if (data.type === 'submit') {
         submissions.set(clientId, data.formData);
         notifyAdmins(clientId, data.formData);
@@ -34,7 +53,7 @@ wss.on('connection', (ws, req) => {
           clientId
         }));
       }
-      
+
       if (data.type === 'admin_decision') {
         decisions.set(data.clientId, data.decision);
         if (activeConnections.has(data.clientId)) {
@@ -66,4 +85,7 @@ function notifyAdmins(clientId, formData) {
   });
 }
 
-console.log('Server running');
+const PORT = process.env.PORT || 8080;
+server.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+});
