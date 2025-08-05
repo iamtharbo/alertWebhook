@@ -1,99 +1,134 @@
-const express = require('express');
-const http = require('http');
-const cors = require('cors');
-const { Server } = require('socket.io');
-const mysql = require('mysql2/promise');
+require('dotenv').config(); 
+const WebSocket = require('ws');
+const mysql = require('mysql2/promise'); 
+const crypto = require('crypto'); 
+const DB_HOST = process.env.DB_HOST || 'localhost';
+const DB_USER = process.env.DB_USER || 'your_mysql_user';
+const DB_PASSWORD = process.env.DB_PASSWORD || 'your_mysql_password';
+const DB_NAME = process.env.DB_NAME || 'form_submissions_db'; 
+const WS_PORT = process.env.PORT || 8765;
+const WS_HOST = '0.0.0.0'; 
 
-const app = express();
-const server = http.createServer(app);
-
-app.use(cors());
-app.use(express.json());
-
-let pool;
-async function initDb() {
-  pool = await mysql.createPool({
-    host: 'mydb.render.com',
-    user: 'mha7_api',
-    password: 'mha7_api',
-    database: 'mha7_api',
-    waitForConnections: true,
-    connectionLimit: 10,
-    queueLimit: 0
-  });
-}
-
-initDb().catch(err => {
-  console.error('Failed to initialize DB connection:', err);
-  process.exit(1);
-});
-
-const io = new Server(server, {
-  cors: {
-    origin: "*",
-  }
-});
-
-io.on('connection', (socket) => {
-  console.log('Client connected:', socket.id);
-});
-
-app.post('/webhook', async (req, res) => {
-  const payload = req.body;
-
-  if (!payload || Object.keys(payload).length === 0) {
-    return res.status(400).json({ success: false, message: 'Empty payload' });
-  }
-
-  try {
-    await pool.query(
-      'INSERT INTO form_submissions (payload, checked) VALUES (?, ?)',
-      [JSON.stringify(payload), false]
-    );
-
-    io.emit('form-submitted', payload);
-
-    res.json({ success: true, message: 'Payload stored and event emitted' });
-  } catch (err) {
-    console.error('Error storing webhook payload:', err);
-    res.status(500).json({ success: false, message: 'Database error' });
-  }
-});
-
-app.get('/pending-submissions', async (req, res) => {
-  try {
-    const [rows] = await pool.query(
-      'SELECT id, payload, received_at FROM form_submissions WHERE checked = false ORDER BY received_at DESC'
-    );
-    res.json({ success: true, data: rows });
-  } catch (err) {
-    console.error('Error fetching pending submissions:', err);
-    res.status(500).json({ success: false, message: 'Database error' });
-  }
-});
-
-app.post('/mark-checked', async (req, res) => {
-  const { id } = req.body;
-  if (!id) {
-    return res.status(400).json({ success: false, message: 'Missing submission ID' });
-  }
-
-  try {
-    const [result] = await pool.query(
-      'UPDATE form_submissions SET checked = true WHERE id = ?',
-      [id]
-    );
-    if (result.affectedRows === 0) {
-      return res.status(404).json({ success: false, message: 'Submission not found' });
+let pool; 
+async function initializeDbPool() {
+    try {
+        pool = mysql.createPool({
+            host: DB_HOST,
+            user: DB_USER,
+            password: DB_PASSWORD,
+            database: DB_NAME,
+            waitForConnections: true,
+            connectionLimit: 10, 
+            queueLimit: 0
+        });
+        console.log('Successfully connected to MySQL database pool!');
+    } catch (err) {
+        console.error('Failed to connect to MySQL database:', err);
+        process.exit(1); 
     }
-    res.json({ success: true, message: 'Marked as checked' });
-  } catch (err) {
-    console.error('Error marking submission checked:', err);
-    res.status(500).json({ success: false, message: 'Database error' });
-  }
+} 
+initializeDbPool();
+
+const wss = new WebSocket.Server({ host: WS_HOST, port: WS_PORT });
+
+wss.on('listening', () => {
+    console.log(`WebSocket server started on ws://${WS_HOST}:${WS_PORT}`);
 });
 
-const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
+wss.on('connection', ws => {
+    console.log('Client connected');
+
+    ws.on('message', async message => {
+        console.log(`Received message: ${message}`);
+        let formData;
+        try {
+            formData = JSON.parse(message);
+        } catch (e) {
+            console.error('Invalid JSON received:', e);
+            ws.send(JSON.stringify({ status: 'error', message: 'Invalid JSON format.' }));
+            ws.close(); 
+            return;
+        }
+
+        const { name, email, message: messageContent } = formData;
+
+        if (!name || !email || !messageContent) {
+            ws.send(JSON.stringify({ status: 'error', message: 'Missing form data fields.' }));
+            ws.close(); 
+            return;
+        }
+
+        let connection;
+        try {
+            connection = await pool.getConnection(); 
+            const submissionTime = new Date();
+            const status = "pending";  
+            const insertSql = `
+                INSERT INTO form_submissions (name, email, message, submission_time, status)
+                VALUES (?, ?, ?, ?, ?)
+            `;
+            const [insertResult] = await connection.execute(insertSql, [name, email, messageContent, submissionTime, status]);
+            const submissionId = insertResult.insertId;  
+            console.log(`Form data stored in DB with ID: ${submissionId}`); 
+            let finalStatus;
+            let reason;
+            if (messageContent.toLowerCase().includes("spam")) {
+                finalStatus = "denied";
+                reason = "Contains 'spam' keyword.";
+            } else if (messageContent.length < 10) {
+                finalStatus = "denied";
+                reason = "Message too short.";
+            } else {
+                finalStatus = "approved";
+                reason = "N/A";
+            } 
+            const updateSql = `
+                UPDATE form_submissions
+                SET status = ?, approval_reason = ?, decision_time = ?
+                WHERE id = ?
+            `;
+            await connection.execute(updateSql, [finalStatus, reason, new Date(), submissionId]);
+            console.log(`Form ID ${submissionId} status updated to: ${finalStatus}`); 
+            const response = {
+                status: finalStatus,
+                submission_id: submissionId,
+                reason: reason
+            };
+            ws.send(JSON.stringify(response));
+            console.log(`Sent response to client for ID ${submissionId}: ${response}`);
+
+        } catch (err) {
+            console.error('Database or server error:', err);
+            ws.send(JSON.stringify({ status: 'error', message: `Server error: ${err.message}` }));
+        } finally {
+            if (connection) {
+                connection.release(); 
+            } 
+            console.log("Closing connection for this submission.");
+            ws.close();
+        }
+    });
+
+    ws.on('close', (code, reason) => {
+        console.log(`Client disconnected: Code ${code}, Reason: ${reason}`);
+    });
+
+    ws.on('error', error => {
+        console.error('WebSocket error:', error);
+    });
+}); 
+process.on('SIGINT', async () => {
+    console.log('Shutting down WebSocket server...');
+    wss.close(() => {
+        console.log('WebSocket server closed.');
+        if (pool) {
+            pool.end(err => {
+                if (err) console.error('Error closing DB pool:', err);
+                else console.log('MySQL connection pool closed.');
+                process.exit(0);
+            });
+        } else {
+            process.exit(0);
+        }
+    });
 });
