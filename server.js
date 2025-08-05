@@ -1,134 +1,162 @@
-require('dotenv').config(); 
+// websocket-server.js
 const WebSocket = require('ws');
-const mysql = require('mysql2/promise'); 
-const crypto = require('crypto'); 
-const DB_HOST = process.env.DB_HOST || 'localhost';
-const DB_USER = process.env.DB_USER || 'your_mysql_user';
-const DB_PASSWORD = process.env.DB_PASSWORD || 'your_mysql_password';
-const DB_NAME = process.env.DB_NAME || 'form_submissions_db'; 
-const WS_PORT = process.env.PORT || 8765;
-const WS_HOST = '0.0.0.0'; 
+const mysql = require('mysql2/promise');
+const uuid = require('uuid');
 
-let pool; 
-async function initializeDbPool() {
+// MySQL connection pool
+const pool = mysql.createPool({
+  host: process.env.DB_HOST,
+  user: process.env.DB_USER,
+  password: process.env.DB_PASSWORD,
+  database: process.env.DB_NAME,
+  waitForConnections: true,
+  connectionLimit: 10
+});
+
+const wss = new WebSocket.Server({ port: process.env.PORT || 8080 });
+
+// Track connected clients and their roles
+const clients = new Map();
+
+wss.on('connection', (ws, req) => {
+  const clientId = uuid.v4();
+  console.log(`New connection: ${clientId}`);
+  
+  // Determine if this is an admin connection (simple example - in production use proper auth)
+  const isAdmin = req.url.includes('?admin=true');
+  
+  clients.set(clientId, { ws, isAdmin });
+  
+  if (isAdmin) {
+    // Send pending submissions to admin
+    sendPendingSubmissions(ws);
+  }
+  
+  ws.on('message', async (message) => {
     try {
-        pool = mysql.createPool({
-            host: DB_HOST,
-            user: DB_USER,
-            password: DB_PASSWORD,
-            database: DB_NAME,
-            waitForConnections: true,
-            connectionLimit: 10, 
-            queueLimit: 0
-        });
-        console.log('Successfully connected to MySQL database pool!');
-    } catch (err) {
-        console.error('Failed to connect to MySQL database:', err);
-        process.exit(1); 
+      const data = JSON.parse(message);
+      
+      if (isAdmin) {
+        // Handle admin actions
+        if (data.action === 'approve' || data.action === 'deny') {
+          await handleAdminDecision(data.submissionId, data.action, clientId);
+        }
+      } else {
+        // Handle form submission from regular client
+        await handleFormSubmission(data, clientId);
+      }
+    } catch (error) {
+      console.error('Error processing message:', error);
+      ws.send(JSON.stringify({
+        type: 'error',
+        message: 'Error processing your request'
+      }));
     }
-} 
-initializeDbPool();
-
-const wss = new WebSocket.Server({ host: WS_HOST, port: WS_PORT });
-
-wss.on('listening', () => {
-    console.log(`WebSocket server started on ws://${WS_HOST}:${WS_PORT}`);
+  });
+  
+  ws.on('close', () => {
+    console.log(`Client disconnected: ${clientId}`);
+    clients.delete(clientId);
+  });
 });
 
-wss.on('connection', ws => {
-    console.log('Client connected');
+async function handleFormSubmission(formData, clientId) {
+  const client = clients.get(clientId);
+  
+  // Store form in MySQL
+  const [result] = await pool.execute(
+    'INSERT INTO form_submissions (form_data, status, client_id) VALUES (?, ?, ?)',
+    [JSON.stringify(formData), 'pending', clientId]
+  );
+  
+  const submissionId = result.insertId;
+  
+  // Send acknowledgment to submitter
+  client.ws.send(JSON.stringify({
+    type: 'acknowledge',
+    submissionId,
+    message: 'Form received and pending approval'
+  }));
+  
+  // Notify all admins about new submission
+  notifyAdminsOfNewSubmission(submissionId, formData);
+}
 
-    ws.on('message', async message => {
-        console.log(`Received message: ${message}`);
-        let formData;
-        try {
-            formData = JSON.parse(message);
-        } catch (e) {
-            console.error('Invalid JSON received:', e);
-            ws.send(JSON.stringify({ status: 'error', message: 'Invalid JSON format.' }));
-            ws.close(); 
-            return;
-        }
+async function handleAdminDecision(submissionId, decision, adminClientId) {
+  const status = decision === 'approve' ? 'approved' : 'denied';
+  
+  // Update status in database
+  await pool.execute(
+    'UPDATE form_submissions SET status = ? WHERE id = ?',
+    [status, submissionId]
+  );
+  
+  // Get the submission details
+  const [rows] = await pool.execute(
+    'SELECT client_id, form_data FROM form_submissions WHERE id = ?',
+    [submissionId]
+  );
+  
+  if (rows.length === 0) return;
+  
+  const submission = rows[0];
+  const clientId = submission.client_id;
+  
+  // Notify the original submitter
+  if (clients.has(clientId)) {
+    const submitter = clients.get(clientId);
+    submitter.ws.send(JSON.stringify({
+      type: 'decision',
+      submissionId,
+      status,
+      message: `Your form has been ${status}!`
+    }));
+    
+    // Close connection after short delay
+    setTimeout(() => submitter.ws.close(), 1000);
+  }
+  
+  // Notify all admins about the decision
+  notifyAdminsOfDecision(submissionId, status, adminClientId);
+}
 
-        const { name, email, message: messageContent } = formData;
+async function sendPendingSubmissions(adminWs) {
+  const [submissions] = await pool.execute(
+    'SELECT id, form_data FROM form_submissions WHERE status = ?',
+    ['pending']
+  );
+  
+  adminWs.send(JSON.stringify({
+    type: 'initial_submissions',
+    submissions: submissions.map(sub => ({
+      id: sub.id,
+      data: JSON.parse(sub.form_data)
+    }))
+  }));
+}
 
-        if (!name || !email || !messageContent) {
-            ws.send(JSON.stringify({ status: 'error', message: 'Missing form data fields.' }));
-            ws.close(); 
-            return;
-        }
+function notifyAdminsOfNewSubmission(submissionId, formData) {
+  clients.forEach((client, clientId) => {
+    if (client.isAdmin) {
+      client.ws.send(JSON.stringify({
+        type: 'new_submission',
+        submissionId,
+        data: formData
+      }));
+    }
+  });
+}
 
-        let connection;
-        try {
-            connection = await pool.getConnection(); 
-            const submissionTime = new Date();
-            const status = "pending";  
-            const insertSql = `
-                INSERT INTO form_submissions (name, email, message, submission_time, status)
-                VALUES (?, ?, ?, ?, ?)
-            `;
-            const [insertResult] = await connection.execute(insertSql, [name, email, messageContent, submissionTime, status]);
-            const submissionId = insertResult.insertId;  
-            console.log(`Form data stored in DB with ID: ${submissionId}`); 
-            let finalStatus;
-            let reason;
-            if (messageContent.toLowerCase().includes("spam")) {
-                finalStatus = "denied";
-                reason = "Contains 'spam' keyword.";
-            } else if (messageContent.length < 10) {
-                finalStatus = "denied";
-                reason = "Message too short.";
-            } else {
-                finalStatus = "approved";
-                reason = "N/A";
-            } 
-            const updateSql = `
-                UPDATE form_submissions
-                SET status = ?, approval_reason = ?, decision_time = ?
-                WHERE id = ?
-            `;
-            await connection.execute(updateSql, [finalStatus, reason, new Date(), submissionId]);
-            console.log(`Form ID ${submissionId} status updated to: ${finalStatus}`); 
-            const response = {
-                status: finalStatus,
-                submission_id: submissionId,
-                reason: reason
-            };
-            ws.send(JSON.stringify(response));
-            console.log(`Sent response to client for ID ${submissionId}: ${response}`);
+function notifyAdminsOfDecision(submissionId, status, adminClientId) {
+  clients.forEach((client, clientId) => {
+    if (client.isAdmin && clientId !== adminClientId) {
+      client.ws.send(JSON.stringify({
+        type: 'submission_decision',
+        submissionId,
+        status
+      }));
+    }
+  });
+}
 
-        } catch (err) {
-            console.error('Database or server error:', err);
-            ws.send(JSON.stringify({ status: 'error', message: `Server error: ${err.message}` }));
-        } finally {
-            if (connection) {
-                connection.release(); 
-            } 
-            console.log("Closing connection for this submission.");
-            ws.close();
-        }
-    });
-
-    ws.on('close', (code, reason) => {
-        console.log(`Client disconnected: Code ${code}, Reason: ${reason}`);
-    });
-
-    ws.on('error', error => {
-        console.error('WebSocket error:', error);
-    });
-}); 
-process.on('SIGINT', async () => {
-    console.log('Shutting down WebSocket server...');
-    wss.close(() => {
-        console.log('WebSocket server closed.');
-        if (pool) {
-            pool.end(err => {
-                if (err) console.error('Error closing DB pool:', err);
-                else console.log('MySQL connection pool closed.');
-                process.exit(0);
-            });
-        } else {
-            process.exit(0);
-        }
-    });
-});
+console.log('WebSocket server running on ws://localhost:8080');
