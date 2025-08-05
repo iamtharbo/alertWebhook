@@ -1,7 +1,5 @@
-// websocket-server.js
 const WebSocket = require('ws');
 const mysql = require('mysql2/promise');
-const uuid = require('uuid');
 
 // MySQL connection pool
 const pool = mysql.createPool({
@@ -19,7 +17,8 @@ const wss = new WebSocket.Server({ port: process.env.PORT || 8080 });
 const clients = new Map();
 
 wss.on('connection', (ws, req) => {
-  const clientId = uuid.v4();
+  // Generate simple client ID using timestamp and random number
+  const clientId = Date.now() + '-' + Math.floor(Math.random() * 1000);
   console.log(`New connection: ${clientId}`);
   
   // Determine if this is an admin connection (simple example - in production use proper auth)
