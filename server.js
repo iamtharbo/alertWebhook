@@ -1,15 +1,22 @@
+const express = require('express');
 const WebSocket = require('ws');
 const http = require('http');
 const axios = require('axios');
 
+const app = express();
 const PORT = process.env.PORT || 8090;
-const server = http.createServer();
+
+const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
 const clients = new Map();
 const sockets = {};
- 
+
 const API_BASE_URL = process.env.API_BASE_URL || 'https://mha777.com/dev/autotran/socket/';
+
+app.get('/', (req, res) => {
+  res.send('eat shit');
+});
 
 wss.on('connection', (ws) => {
   console.log('New WebSocket connection');
@@ -17,6 +24,7 @@ wss.on('connection', (ws) => {
   ws.on('message', async (message) => {
     try {
       const data = JSON.parse(message);
+
       if (data.type === 'auth') {
         const { username, role } = data;
         if (!username || !role) {
@@ -40,7 +48,7 @@ wss.on('connection', (ws) => {
         if (!sender || !msg || !receiver) {
           return ws.send(JSON.stringify({ status: 'error', message: 'err message data' }));
         }
- 
+
         const response = await axios.post(`${API_BASE_URL}/store_message.php`, {
           sender,
           receiver,
@@ -61,7 +69,8 @@ wss.on('connection', (ws) => {
 
         const target = sockets[receiver];
         if (target && target.readyState === WebSocket.OPEN) {
-          target.send(JSON.stringify(payload)); 
+          target.send(JSON.stringify(payload));
+
           await axios.post(`${API_BASE_URL}/update_message_read.php`, {
             sender,
             receiver,
@@ -74,7 +83,7 @@ wss.on('connection', (ws) => {
       }
     } catch (e) {
       console.error('Error message:', e.message);
-      ws.send(JSON.stringify({ status: 'error', message: 'sr err' }));
+      ws.send(JSON.stringify({ status: 'error', message: 'server error' }));
     }
   });
 
@@ -94,7 +103,7 @@ wss.on('connection', (ws) => {
 
 async function sendUnreadMessages(ws, username, role) {
   try {
-    const receiver = username; 
+    const receiver = role === 'admin' ? 'admin' : username;
 
     const response = await axios.post(`${API_BASE_URL}/get_unread_messages.php`, {
       receiver,
@@ -105,22 +114,13 @@ async function sendUnreadMessages(ws, username, role) {
     }
 
     const messages = response.data.messages || [];
-
-    console.log(`Sending ${messages.length} unread messages to ${username}`);
-
     for (const msg of messages) {
       ws.send(JSON.stringify(msg));
     }
   } catch (e) {
     console.error('err unread messages:', e.message);
-    ws.send(JSON.stringify({ status: 'error', message: 'Unread message fetch failed' }));
   }
-}
-
-async function startServer() {
-  server.listen(PORT, () => {
-    console.log(`socket running ${PORT}`);
-  });
-}
-
-startServer();
+} 
+server.listen(PORT, () => {
+  console.log(` Server running on port ${PORT}`);
+});
