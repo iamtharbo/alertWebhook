@@ -94,8 +94,8 @@ wss.on('connection', (ws) => {
 
 async function sendUnreadMessages(ws, username, role) {
   try {
-    const receiver = role === 'admin' ? 'admin' : username;
- 
+    const receiver = username; 
+
     const response = await axios.post(`${API_BASE_URL}/get_unread_messages.php`, {
       receiver,
     });
@@ -105,11 +105,15 @@ async function sendUnreadMessages(ws, username, role) {
     }
 
     const messages = response.data.messages || [];
+
+    console.log(`Sending ${messages.length} unread messages to ${username}`);
+
     for (const msg of messages) {
       ws.send(JSON.stringify(msg));
     }
   } catch (e) {
     console.error('err unread messages:', e.message);
+    ws.send(JSON.stringify({ status: 'error', message: 'Unread message fetch failed' }));
   }
 }
 
